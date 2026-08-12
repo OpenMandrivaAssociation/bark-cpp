@@ -1,0 +1,1019 @@
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/CMakeLists.txt
+--- a/CMakeLists.txt	2024-11-16 15:20:46.000000000 +0100
++++ b/CMakeLists.txt	2026-08-12 17:15:01.920681571 +0200
+@@ -1,7 +1,7 @@
+-cmake_minimum_required(VERSION 3.12)
+-project("bark" C CXX)
++cmake_minimum_required(VERSION 3.16)
++project(bark VERSION 1.0.0 LANGUAGES C CXX)
+ 
+-set(BARK_BUILD_EXAMPLES ON)
++include(GNUInstallDirs)
+ 
+ if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+@@ -9,37 +9,78 @@
+ endif()
+ 
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
++set(CMAKE_CXX_STANDARD 11)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+-if (EMSCRIPTEN)
+-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread -O3")
+-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O3")
++option(BUILD_SHARED_LIBS "build shared libraries" ON)
++option(BARK_BUILD_EXAMPLES "bark: build examples" ON)
++option(BARK_USE_SYSTEM_GGML "bark: use system ggml (find_package)" ON)
++
++if (BARK_USE_SYSTEM_GGML)
++    find_package(ggml REQUIRED CONFIG)
++    set(GGML_TARGET ggml::ggml)
+ endif()
+ 
+-set(BARK_LIB bark)
++if (BARK_BUILD_EXAMPLES)
++    set(ENCODEC_BUILD_EXAMPLES ON CACHE BOOL "encodec: build examples" FORCE)
++endif()
+ 
+ add_subdirectory(encodec.cpp)
++if (NOT BARK_USE_SYSTEM_GGML)
++    set(GGML_TARGET ggml)
++endif()
+ 
+ add_definitions(-DEXPORTING_BARK)
+ 
+-add_library(${BARK_LIB} STATIC bark.cpp bark.h)
++add_library(bark bark.cpp bark.h)
++set_target_properties(bark PROPERTIES
++    VERSION ${PROJECT_VERSION}
++    SOVERSION 0
++    OUTPUT_NAME bark
++    PUBLIC_HEADER bark.h
++)
++target_link_libraries(bark PUBLIC encodec ${GGML_TARGET})
++target_include_directories(bark PUBLIC
++    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
++    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
++)
++target_compile_features(bark PUBLIC cxx_std_11)
+ 
+ if (BARK_BUILD_EXAMPLES)
+     add_subdirectory(examples)
+ endif()
+ 
+-target_link_libraries(${BARK_LIB} PUBLIC ggml encodec)
+-target_include_directories(${BARK_LIB} PUBLIC .)
+-target_compile_features(${BARK_LIB} PUBLIC cxx_std_11)
+-
+-if (EMSCRIPTEN)
+-    set_target_properties(${BARK_LIB} PROPERTIES COMPILE_FLAGS "-msimd128")
+-endif()
+-
+-if (GGML_CUBLAS)
+-    add_compile_definitions(GGML_USE_CUBLAS)
+-endif()
+-
+-if (GGML_METAL)
+-    add_compile_definitions(GGML_USE_METAL)
+-endif()
++install(TARGETS bark
++    EXPORT bark-targets
++    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
++)
++
++install(EXPORT bark-targets
++    FILE bark-targets.cmake
++    NAMESPACE bark::
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bark
++)
++
++include(CMakePackageConfigHelpers)
++write_basic_package_version_file(
++    "${CMAKE_CURRENT_BINARY_DIR}/bark-config-version.cmake"
++    VERSION ${PROJECT_VERSION}
++    COMPATIBILITY SameMajorVersion
++)
++file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/bark-config.cmake"
++"include(CMakeFindDependencyMacro)
++find_dependency(ggml REQUIRED)
++include(\"\${CMAKE_CURRENT_LIST_DIR}/bark-targets.cmake\")
++")
++install(FILES
++    "${CMAKE_CURRENT_BINARY_DIR}/bark-config.cmake"
++    "${CMAKE_CURRENT_BINARY_DIR}/bark-config-version.cmake"
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bark
++)
++
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/bark.pc.in"
++    "${CMAKE_CURRENT_BINARY_DIR}/bark.pc" @ONLY)
++install(FILES "${CMAKE_CURRENT_BINARY_DIR}/bark.pc"
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/bark.cpp src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/bark.cpp
+--- a/bark.cpp	2024-11-16 15:20:46.000000000 +0100
++++ b/bark.cpp	2026-08-12 17:13:59.649343601 +0200
+@@ -2,14 +2,6 @@
+ #include "ggml-backend.h"
+ #include "ggml.h"
+ 
+-#ifdef GGML_USE_CUDA
+-#include "ggml-cuda.h"
+-#endif
+-
+-#ifdef GGML_USE_METAL
+-#include "ggml-metal.h"
+-#endif
+-
+ #include <cassert>
+ #include <cmath>
+ #include <cstdio>
+@@ -29,6 +21,37 @@
+ 
+ #define EPS_NORM 1e-5f
+ 
++// ggml 0.19 ships backends as dlopen plugins (GGML_BACKEND_DL). The
++// old ggml_backend_cpu_init / cuda_init symbols live in those plugins,
++// not in libggml. Load the registry and pick GPU-if-present.
++static ggml_backend_t bark_init_backend(int n_gpu_layers) {
++    ggml_backend_load_all();
++    ggml_backend_t backend = NULL;
++    if (n_gpu_layers > 0) {
++        backend = ggml_backend_init_best();
++    }
++    if (!backend) {
++        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
++    }
++    if (backend) {
++        fprintf(stderr, "%s: using backend %s\n", __func__, ggml_backend_name(backend));
++    }
++    return backend;
++}
++
++static void bark_backend_set_n_threads(ggml_backend_t backend, int n_threads) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    if (!dev) {
++        return;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    auto fn = (ggml_backend_set_n_threads_t)
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++    if (fn) {
++        fn(backend, n_threads);
++    }
++}
++
+ #define MAX(a, b) ((a) > (b) ? (a) : (b))
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ 
+@@ -303,9 +326,7 @@
+         case GGML_FTYPE_MOSTLY_IQ4_XS:
+         case GGML_FTYPE_MOSTLY_IQ1_M:
+         case GGML_FTYPE_MOSTLY_BF16:
+-        case GGML_FTYPE_MOSTLY_Q4_0_4_4:
+-        case GGML_FTYPE_MOSTLY_Q4_0_4_8:
+-        case GGML_FTYPE_MOSTLY_Q4_0_8_8:
++        default:
+                 {
+                     fprintf(stderr, "%s: invalid model type %d\n", __func__, ftype);
+                     return false;
+@@ -445,13 +466,7 @@
+                 case GGML_TYPE_IQ4_NL:
+                 case GGML_TYPE_IQ4_XS:
+                 case GGML_TYPE_IQ1_M:
+-                case GGML_TYPE_BF16:
+-                case GGML_TYPE_Q4_0_4_4:
+-                case GGML_TYPE_Q4_0_4_8:
+-                case GGML_TYPE_Q4_0_8_8:
+-                case GGML_TYPE_TQ1_0:
+-                case GGML_TYPE_TQ2_0:
+-                case GGML_TYPE_COUNT:
++                default:
+                     {
+                         fprintf(stderr, "%s: unsupported quantization type %d (%s)\n", __func__, ttype, ggml_type_name((ggml_type) ttype));
+                         return false;
+@@ -820,39 +835,9 @@
+         }
+     }
+ 
+-#ifdef GGML_USE_CUDA
+-    if (n_gpu_layers > 0) {
+-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+-        model.backend = ggml_backend_cuda_init();
+-        if (!model.backend) {
+-            fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
+-        }
+-    }
+-#endif
+-
+-#ifdef GGML_USE_METAL
+-    if (n_gpu_layers > 0) {
+-        fprintf(stderr, "%s: using Metal backend\n", __func__);
+-        model.backend = ggml_backend_metal_init();
+-        if (!model.backend) {
+-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
+-        }
+-    }
+-#endif
+-
++    model.backend = bark_init_backend(n_gpu_layers);
+     if (!model.backend) {
+-        // fallback to CPU backend
+-        if (verbosity == bark_verbosity_level::HIGH) {
+-            fprintf(stderr, "%s: no backend specified, using CPU backend\n", __func__);
+-        }
+-        model.backend = ggml_backend_cpu_init();
+-    }
+-
+-    if (!model.backend) {
+-        if (verbosity == bark_verbosity_level::HIGH) {
+-            fprintf(stderr, "%s: failed to initialize CPU backend\n", __func__);
+-        }
+-
++        fprintf(stderr, "%s: failed to initialize ggml backend\n", __func__);
+         return false;
+     }
+ 
+@@ -1169,6 +1154,7 @@
+     struct bark_context * bctx = new bark_context();
+ 
+     bctx->text_model = bark_model();
++    bctx->n_gpu_layers = params.n_gpu_layers;
+ 
+     std::string model_path_str(model_path);
+     if (!bark_load_model_from_file(model_path_str, bctx, params.verbosity)) {
+@@ -1620,9 +1606,7 @@
+     }
+ 
+     // set backend options
+-    if (ggml_backend_is_cpu(model.backend)) {
+-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+-    }
++    bark_backend_set_n_threads(model.backend, n_threads);
+ 
+     // run the computation
+     ggml_backend_graph_compute(model.backend, gf);
+@@ -1942,9 +1926,7 @@
+     }
+ 
+     // set backend options
+-    if (ggml_backend_is_cpu(model.backend)) {
+-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+-    }
++    bark_backend_set_n_threads(model.backend, n_threads);
+ 
+     // run the computation
+     ggml_backend_graph_compute(model.backend, gf);
+@@ -2226,6 +2208,7 @@
+         /*.codebook_size               =*/ 1024,
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
++        /*.n_gpu_layers                =*/ 99,
+     };
+ 
+     return result;
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/bark.h src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/bark.h
+--- a/bark.h	2024-11-16 15:20:46.000000000 +0100
++++ b/bark.h	2026-08-12 17:13:59.613343154 +0200
+@@ -138,6 +138,11 @@
+         // called on each progress update
+         bark_progress_callback progress_callback;
+         void * progress_callback_user_data;
++
++        // >0: pick the best ggml backend (GPU if a plugin is present).
++        //  0: force the CPU plugin. Layer-wise offload is not implemented;
++        // the whole model lives on one backend.
++        int32_t n_gpu_layers;
+     };
+ 
+     /**
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/cmake/bark.pc.in src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/cmake/bark.pc.in
+--- a/cmake/bark.pc.in	1970-01-01 01:00:00.000000000 +0100
++++ b/cmake/bark.pc.in	2026-08-12 17:13:36.577645822 +0200
+@@ -0,0 +1,11 @@
++prefix=@CMAKE_INSTALL_PREFIX@
++exec_prefix=${prefix}
++libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
++includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
++
++Name: bark
++Description: Suno Bark text-to-speech inference (bark.cpp)
++Version: @PROJECT_VERSION@
++Requires: ggml
++Libs: -L${libdir} -lbark
++Cflags: -I${includedir}
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/CMakeLists.txt
+--- a/encodec.cpp/CMakeLists.txt	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,5 +1,7 @@
+-cmake_minimum_required(VERSION 3.12)
+-project("encodec" C CXX)
++cmake_minimum_required(VERSION 3.16)
++project(encodec VERSION 0.0.1 LANGUAGES C CXX)
++
++include(GNUInstallDirs)
+ 
+ if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+@@ -7,10 +9,8 @@
+ endif()
+ 
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+-set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0")
+-
+-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++set(CMAKE_CXX_STANDARD 11)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+     set(ENCODEC_STANDALONE ON)
+@@ -19,16 +19,20 @@
+ endif()
+ 
+ option(ENCODEC_BUILD_EXAMPLES "encodec: build examples" ${ENCODEC_STANDALONE})
++option(ENCODEC_USE_SYSTEM_GGML "encodec: use system ggml" ON)
++option(BUILD_SHARED_LIBS "build shared libraries" ON)
+ 
+-# Build libraries
+-
+-set(ENCODEC_LIB encodec)
+-option(BUILD_SHARED_LIBS "build shared libraries" OFF)
+-
+-add_subdirectory(ggml)
++if (ENCODEC_USE_SYSTEM_GGML)
++    if (NOT TARGET ggml::ggml)
++        find_package(ggml REQUIRED CONFIG)
++    endif()
++    set(GGML_TARGET ggml::ggml)
++else()
++    add_subdirectory(ggml)
++    set(GGML_TARGET ggml)
++endif()
+ 
+-add_library(
+-    ${ENCODEC_LIB}
++add_library(encodec
+     encodec.cpp
+     encodec.h
+     encoder.h
+@@ -39,19 +43,54 @@
+     utils.h
+     lstm.h
+ )
++set_target_properties(encodec PROPERTIES
++    VERSION ${PROJECT_VERSION}
++    SOVERSION 0
++    OUTPUT_NAME encodec
++    PUBLIC_HEADER encodec.h
++)
++target_link_libraries(encodec PUBLIC ${GGML_TARGET})
++target_include_directories(encodec PUBLIC
++    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
++    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
++)
++target_compile_features(encodec PUBLIC cxx_std_11)
+ 
+ if (ENCODEC_BUILD_EXAMPLES)
+     add_subdirectory(examples)
+ endif()
+ 
+-target_link_libraries(${ENCODEC_LIB} PUBLIC ggml)
+-target_include_directories(${ENCODEC_LIB} PUBLIC .)
+-target_compile_features(${ENCODEC_LIB} PUBLIC cxx_std_11)
++install(TARGETS encodec
++    EXPORT encodec-targets
++    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
++)
+ 
+-if (GGML_CUBLAS)
+-    add_compile_definitions(GGML_USE_CUBLAS)
+-endif()
++install(EXPORT encodec-targets
++    FILE encodec-targets.cmake
++    NAMESPACE encodec::
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/encodec
++)
+ 
+-if (GGML_METAL)
+-    add_compile_definitions(GGML_USE_METAL)
+-endif()
++include(CMakePackageConfigHelpers)
++write_basic_package_version_file(
++    "${CMAKE_CURRENT_BINARY_DIR}/encodec-config-version.cmake"
++    VERSION ${PROJECT_VERSION}
++    COMPATIBILITY SameMajorVersion
++)
++file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/encodec-config.cmake"
++"include(CMakeFindDependencyMacro)
++find_dependency(ggml REQUIRED)
++include(\"\${CMAKE_CURRENT_LIST_DIR}/encodec-targets.cmake\")
++")
++install(FILES
++    "${CMAKE_CURRENT_BINARY_DIR}/encodec-config.cmake"
++    "${CMAKE_CURRENT_BINARY_DIR}/encodec-config-version.cmake"
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/encodec
++)
++
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/encodec.pc.in"
++    "${CMAKE_CURRENT_BINARY_DIR}/encodec.pc" @ONLY)
++install(FILES "${CMAKE_CURRENT_BINARY_DIR}/encodec.pc"
++    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/cmake/encodec.pc.in src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/cmake/encodec.pc.in
+--- a/encodec.cpp/cmake/encodec.pc.in	1970-01-01 01:00:00.000000000 +0100
++++ b/encodec.cpp/cmake/encodec.pc.in	2026-08-12 17:13:36.577645822 +0200
+@@ -0,0 +1,11 @@
++prefix=@CMAKE_INSTALL_PREFIX@
++exec_prefix=${prefix}
++libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
++includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
++
++Name: encodec
++Description: Meta Encodec audio codec inference (encodec.cpp)
++Version: @PROJECT_VERSION@
++Requires: ggml
++Libs: -L${libdir} -lencodec
++Cflags: -I${includedir}
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/encodec.cpp src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/encodec.cpp
+--- a/encodec.cpp/encodec.cpp	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/encodec.cpp	2026-08-12 17:14:26.405676576 +0200
+@@ -1,15 +1,6 @@
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ #include "ggml.h"
+-#include "ggml/src/ggml-impl.h"
+-
+-#ifdef GGML_USE_CUBLAS
+-#include "ggml-cuda.h"
+-#endif
+-
+-#ifdef GGML_USE_METAL
+-#include "ggml-metal.h"
+-#endif
+ 
+ #include <cassert>
+ #include <cmath>
+@@ -35,6 +26,34 @@
+ #define ENCODEC_FILE_MAGIC 'ggml'
+ #define ENCODEC_MAX_NODES 80000
+ 
++static ggml_backend_t encodec_init_backend(int n_gpu_layers) {
++    ggml_backend_load_all();
++    ggml_backend_t backend = NULL;
++    if (n_gpu_layers > 0) {
++        backend = ggml_backend_init_best();
++    }
++    if (!backend) {
++        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
++    }
++    if (backend) {
++        fprintf(stderr, "%s: using backend %s\n", __func__, ggml_backend_name(backend));
++    }
++    return backend;
++}
++
++static void encodec_backend_set_n_threads(ggml_backend_t backend, int n_threads) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    if (!dev) {
++        return;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    auto fn = (ggml_backend_set_n_threads_t)
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++    if (fn) {
++        fn(backend, n_threads);
++    }
++}
++
+ typedef enum {
+     // Run the end-to-end encoder-decoder pipeline
+     FULL = 0,
+@@ -98,27 +117,12 @@
+     std::map<std::string, struct ggml_tensor *> tensors;
+ };
+ 
+-struct encodec_ggml_cgraph_deleter {
+-    void operator()(struct ggml_cgraph * cgraph) {
+-        if (cgraph->nodes)
+-            free(cgraph->nodes);
+-        if (cgraph->leafs)
+-            free(cgraph->leafs);
+-        if (cgraph->visited_hash_set.keys)
+-            free(cgraph->visited_hash_set.keys);
+-        if (cgraph->grads)
+-            free(cgraph->grads);
+-        free(cgraph);
+-    }
+-};
+-
+ struct encodec_context {
+     encodec_model model;
+ 
+-    // computational graph stored on the heap to avoid stack overflows
+-    // the computational graph grows with the sequence length (because of the LSTM)
+-    // which requires a lot of nodes
+-    std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter> gf;
++    // Graph lives in the static ggml context buffer (ggml_new_graph_custom).
++    // ggml_cgraph is opaque in ggml 0.19; do not poke at its fields.
++    struct ggml_cgraph * gf = NULL;
+ 
+     // buffer for model evaluation
+     ggml_backend_buffer_t buf_compute;
+@@ -209,34 +213,9 @@
+         }
+     }
+ 
+-#ifdef GGML_USE_CUBLAS
+-    if (n_gpu_layers > 0) {
+-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+-        model.backend = ggml_backend_cuda_init();
+-        if (!model.backend) {
+-            fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
+-        }
+-    }
+-#endif
+-
+-#ifdef GGML_USE_METAL
+-    if (n_gpu_layers > 0) {
+-        fprintf(stderr, "%s: using Metal backend\n", __func__);
+-        model.backend = ggml_backend_metal_init();
+-        if (!model.backend) {
+-            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
+-        }
+-    }
+-#endif
+-
++    model.backend = encodec_init_backend(n_gpu_layers);
+     if (!model.backend) {
+-        // fallback to CPU backend
+-        fprintf(stderr, "%s: using CPU backend\n", __func__);
+-        model.backend = ggml_backend_cpu_init();
+-    }
+-
+-    if (!model.backend) {
+-        fprintf(stderr, "%s: ggml_backend_cpu_init() failed\n", __func__);
++        fprintf(stderr, "%s: failed to initialize ggml backend\n", __func__);
+         return false;
+     }
+ 
+@@ -501,48 +480,6 @@
+     return true;
+ }
+ 
+-// Create a new ggml_cgraph with the given size (usually ENCODEC_MAX_NODES). We need a
+-// custom function since the graph is so large, it overpasses the max built-in ggml
+-// default size.
+-static struct ggml_cgraph * encodec_ggml_cgraph_create(size_t size) {
+-    struct ggml_cgraph * cgraph = (struct ggml_cgraph *)calloc(1, sizeof(struct ggml_cgraph));
+-    cgraph->size = size;
+-    cgraph->n_nodes = 0;
+-    cgraph->n_leafs = 0;
+-    cgraph->nodes = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
+-    cgraph->leafs = (struct ggml_tensor **)calloc(1, size * sizeof(struct ggml_tensor *));
+-
+-    // next primes after powers of two
+-    static const size_t primes[] = {
+-        2, 3, 5, 11, 17, 37, 67, 131, 257, 521, 1031,
+-        2053, 4099, 8209, 16411, 32771, 65537, 131101,
+-        262147, 524309, 1048583, 2097169, 4194319, 8388617,
+-        16777259, 33554467, 67108879, 134217757, 268435459,
+-        536870923, 1073741827, 2147483659
+-    };
+-    static const size_t n_primes = sizeof(primes)/sizeof(primes[0]);
+-
+-    // find the smallest prime that is larger or equal to size
+-    size_t l = 0;
+-    size_t r = n_primes;
+-    while (l < r) {
+-        size_t m = (l + r)/2;
+-        if (primes[m] < size * 2) {
+-            l = m + 1;
+-        } else {
+-            r = m;
+-        }
+-    }
+-    size_t hash_size = l < n_primes ? primes[l] : (size * 2 + 1);
+-
+-    cgraph->visited_hash_set.size = hash_size;
+-    cgraph->visited_hash_set.keys = (struct ggml_tensor **)calloc(1, hash_size * sizeof(struct ggml_tensor *));
+-    cgraph->visited_hash_set.used = (ggml_bitset_t *)calloc(1, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t));
+-    cgraph->order = GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT;
+-
+-    return cgraph;
+-}
+-
+ void encodec_build_graph(struct encodec_context *ectx,
+                          const float * inp_audio,
+                          const int n_samples,
+@@ -568,7 +505,7 @@
+ 
+     // since we are using ggml-alloc, this buffer only needs enough space to hold the
+     // ggml_tensor and ggml_cgraph structs, but not the tensor data
+-    static size_t buf_size = ggml_tensor_overhead() * ENCODEC_MAX_NODES + ggml_graph_overhead();
++    static size_t buf_size = ggml_tensor_overhead() * ENCODEC_MAX_NODES + ggml_graph_overhead_custom(ENCODEC_MAX_NODES, false);
+     static std::vector<uint8_t> buf(buf_size);
+ 
+     struct ggml_init_params ggml_params = {
+@@ -579,7 +516,7 @@
+ 
+     struct ggml_context *ctx0 = ggml_init(ggml_params);
+ 
+-    gf = std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter>(encodec_ggml_cgraph_create(ENCODEC_MAX_NODES));
++    gf = ggml_new_graph_custom(ctx0, ENCODEC_MAX_NODES, false);
+ 
+     struct ggml_tensor *inp = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+     ggml_set_name(inp, "inp");
+@@ -605,12 +542,12 @@
+         case encodec_run_mode_t::FULL: {
+             ggml_set_name(decoded, "decoded");
+             ggml_set_output(decoded);
+-            ggml_build_forward_expand(gf.get(), decoded);
++            ggml_build_forward_expand(gf, decoded);
+         } break;
+         case encodec_run_mode_t::ENCODE: {
+             ggml_set_name(codes, "codes");
+             ggml_set_output(codes);
+-            ggml_build_forward_expand(gf.get(), codes);
++            ggml_build_forward_expand(gf, codes);
+         } break;
+         case encodec_run_mode_t::DECODE: {
+             assert(false);
+@@ -657,7 +594,7 @@
+ 
+     const int N = n_codes / n_q;
+ 
+-    static size_t buf_size = ggml_tensor_overhead() * ENCODEC_MAX_NODES + ggml_graph_overhead();
++    static size_t buf_size = ggml_tensor_overhead() * ENCODEC_MAX_NODES + ggml_graph_overhead_custom(ENCODEC_MAX_NODES, false);
+     static std::vector<uint8_t> buf(buf_size);
+ 
+     struct ggml_init_params ggml_params = {
+@@ -668,7 +605,7 @@
+ 
+     struct ggml_context *ctx0 = ggml_init(ggml_params);
+ 
+-    gf = std::unique_ptr<struct ggml_cgraph, encodec_ggml_cgraph_deleter>(encodec_ggml_cgraph_create(ENCODEC_MAX_NODES));
++    gf = ggml_new_graph_custom(ctx0, ENCODEC_MAX_NODES, false);
+ 
+     struct ggml_tensor *inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, N, n_q);
+     ggml_set_name(inp_codes, "inp_codes");
+@@ -689,7 +626,7 @@
+         case encodec_run_mode_t::DECODE: {
+             ggml_set_name(decoded, "decoded");
+             ggml_set_output(decoded);
+-            ggml_build_forward_expand(gf.get(), decoded);
++            ggml_build_forward_expand(gf, decoded);
+         } break;
+         default: {
+             fprintf(stderr, "%s: unknown run mode\n", __func__);
+@@ -719,33 +656,31 @@
+     encodec_build_graph(ectx, raw_audio, n_samples, mode);
+ 
+     // allocate the graph tensors
+-    ggml_gallocr_alloc_graph(allocr, gf.get());
++    ggml_gallocr_alloc_graph(allocr, gf);
+ 
+     // set the graph inputs
+-    struct ggml_tensor * inp = ggml_graph_get_tensor(gf.get(), "inp");
++    struct ggml_tensor * inp = ggml_graph_get_tensor(gf, "inp");
+     ggml_backend_tensor_set(inp, raw_audio, 0, n_samples * ggml_element_size(inp));
+ 
+     // make sure accumulation tensor are zeroed
+-    encodec_zero_tensor(gf.get(), "enc_l0_ht");
+-    encodec_zero_tensor(gf.get(), "enc_l1_ht");
+-    encodec_zero_tensor(gf.get(), "enc_l0_ct");
+-    encodec_zero_tensor(gf.get(), "enc_l1_ct");
++    encodec_zero_tensor(gf, "enc_l0_ht");
++    encodec_zero_tensor(gf, "enc_l1_ht");
++    encodec_zero_tensor(gf, "enc_l0_ct");
++    encodec_zero_tensor(gf, "enc_l1_ct");
+ 
+     if (mode == encodec_run_mode_t::FULL) {
+-        encodec_zero_tensor(gf.get(), "dec_l0_ht");
+-        encodec_zero_tensor(gf.get(), "dec_l1_ht");
+-        encodec_zero_tensor(gf.get(), "dec_l0_ct");
+-        encodec_zero_tensor(gf.get(), "dec_l1_ct");
++        encodec_zero_tensor(gf, "dec_l0_ht");
++        encodec_zero_tensor(gf, "dec_l1_ht");
++        encodec_zero_tensor(gf, "dec_l0_ct");
++        encodec_zero_tensor(gf, "dec_l1_ct");
+ 
+-        encodec_zero_tensor(gf.get(), "quantized_out");
++        encodec_zero_tensor(gf, "quantized_out");
+     }
+ 
+     // run the computation
+-    if (ggml_backend_is_cpu(model.backend)) {
+-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+-    }
++    encodec_backend_set_n_threads(model.backend, n_threads);
+ 
+-    ggml_backend_graph_compute(model.backend, gf.get());
++    ggml_backend_graph_compute(model.backend, gf);
+ 
+     return true;
+ }
+@@ -762,26 +697,24 @@
+     encodec_build_graph(ectx, codes, n_codes, mode);
+ 
+     // allocate the graph tensors
+-    ggml_gallocr_alloc_graph(allocr, gf.get());
++    ggml_gallocr_alloc_graph(allocr, gf);
+ 
+     // set the graph inputs
+-    struct ggml_tensor * inp = ggml_graph_get_tensor(gf.get(), "inp_codes");
++    struct ggml_tensor * inp = ggml_graph_get_tensor(gf, "inp_codes");
+     ggml_backend_tensor_set(inp, codes, 0, n_codes * ggml_element_size(inp));
+ 
+     // make sure accumulation tensors are zeroed
+-    encodec_zero_tensor(gf.get(), "dec_l0_ht");
+-    encodec_zero_tensor(gf.get(), "dec_l1_ht");
+-    encodec_zero_tensor(gf.get(), "dec_l0_ct");
+-    encodec_zero_tensor(gf.get(), "dec_l1_ct");
++    encodec_zero_tensor(gf, "dec_l0_ht");
++    encodec_zero_tensor(gf, "dec_l1_ht");
++    encodec_zero_tensor(gf, "dec_l0_ct");
++    encodec_zero_tensor(gf, "dec_l1_ct");
+ 
+-    encodec_zero_tensor(gf.get(), "quantized_out");
++    encodec_zero_tensor(gf, "quantized_out");
+ 
+     // run the computation
+-    if (ggml_backend_is_cpu(model.backend)) {
+-        ggml_backend_cpu_set_n_threads(model.backend, n_threads);
+-    }
++    encodec_backend_set_n_threads(model.backend, n_threads);
+ 
+-    ggml_backend_graph_compute(model.backend, gf.get());
++    ggml_backend_graph_compute(model.backend, gf);
+ 
+     return true;
+ }
+@@ -800,7 +733,7 @@
+         encodec_build_graph(ectx, raw_audio, n_samples, mode);
+ 
+         // pre-allocate the compute buffer
+-        ggml_gallocr_reserve(ectx->allocr, ectx->gf.get());
++        ggml_gallocr_reserve(ectx->allocr, ectx->gf);
+         size_t mem_size = ggml_gallocr_get_buffer_size(ectx->allocr, 0);
+         fprintf(stderr, "%s: compute buffer size: %.2f MB\n\n", __func__, mem_size / 1024.0 / 1024.0);
+     }
+@@ -830,7 +763,7 @@
+         encodec_build_graph(ectx, codes, n_codes, mode);
+ 
+         // pre-allocate the compute buffer
+-        ggml_gallocr_reserve(ectx->allocr, ectx->gf.get());
++        ggml_gallocr_reserve(ectx->allocr, ectx->gf);
+         size_t mem_size = ggml_gallocr_get_buffer_size(ectx->allocr, 0);
+         fprintf(stderr, "%s: compute buffer size: %.2f MB\n\n", __func__, mem_size / 1024.0 / 1024.0);
+     }
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/CMakeLists.txt
+--- a/encodec.cpp/examples/CMakeLists.txt	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/examples/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,6 +1,7 @@
+-add_library(common STATIC common.cpp)
+-target_include_directories(common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+-target_compile_features(common PRIVATE cxx_std_11)
++add_library(encodec-common STATIC common.cpp)
++target_include_directories(encodec-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_compile_features(encodec-common PRIVATE cxx_std_11)
++set_target_properties(encodec-common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+ add_subdirectory(main)
+ add_subdirectory(compress)
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/common.h src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/common.h
+--- a/encodec.cpp/examples/common.h	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/examples/common.h	2026-08-12 17:14:50.814876801 +0200
+@@ -1,4 +1,6 @@
++#include <algorithm>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ /**
+@@ -10,16 +12,16 @@
+     int32_t n_threads = std::min(4, (int32_t) std::thread::hardware_concurrency());
+ 
+     // weights location
+-    std::string model_path = "/Users/pbannier/Documents/encodec.cpp/ggml_weights/ggml-model.bin";
++    std::string model_path = "./ggml_weights.bin";
+ 
+     // input location
+-    std::string input_path = "/Users/pbannier/Documents/encodec/decomp_24khz_True.wav";
++    std::string input_path = "input.wav";
+ 
+     // output location
+     std::string output_path = "output.wav";
+ 
+-    // number of GPU layers to use
+-    int32_t n_gpu_layers = 0;
++    // >0: best ggml backend (GPU if present). 0: CPU.
++    int32_t n_gpu_layers = 99;
+ };
+ 
+ /**
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/compress/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/compress/CMakeLists.txt
+--- a/encodec.cpp/examples/compress/CMakeLists.txt	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/examples/compress/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,4 +1,4 @@
+-set(TARGET compress)
+-add_executable(${TARGET} main.cpp)
+-target_link_libraries(${TARGET} PRIVATE encodec common)
+-target_compile_features(${TARGET} PRIVATE cxx_std_11)
+\ No newline at end of file
++add_executable(encodec-compress main.cpp)
++target_link_libraries(encodec-compress PRIVATE encodec encodec-common)
++target_compile_features(encodec-compress PRIVATE cxx_std_11)
++install(TARGETS encodec-compress RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/decompress/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/decompress/CMakeLists.txt
+--- a/encodec.cpp/examples/decompress/CMakeLists.txt	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/examples/decompress/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,4 +1,4 @@
+-set(TARGET decompress)
+-add_executable(${TARGET} main.cpp)
+-target_link_libraries(${TARGET} PRIVATE encodec common)
+-target_compile_features(${TARGET} PRIVATE cxx_std_11)
+\ No newline at end of file
++add_executable(encodec-decompress main.cpp)
++target_link_libraries(encodec-decompress PRIVATE encodec encodec-common)
++target_compile_features(encodec-decompress PRIVATE cxx_std_11)
++install(TARGETS encodec-decompress RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/main/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/encodec.cpp/examples/main/CMakeLists.txt
+--- a/encodec.cpp/examples/main/CMakeLists.txt	2024-11-16 15:09:55.000000000 +0100
++++ b/encodec.cpp/examples/main/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,4 +1,4 @@
+-set(TARGET main)
+-add_executable(${TARGET} main.cpp)
+-target_link_libraries(${TARGET} PRIVATE encodec common)
+-target_compile_features(${TARGET} PRIVATE cxx_std_11)
+\ No newline at end of file
++add_executable(encodec-cli main.cpp)
++target_link_libraries(encodec-cli PRIVATE encodec encodec-common)
++target_compile_features(encodec-cli PRIVATE cxx_std_11)
++install(TARGETS encodec-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/CMakeLists.txt
+--- a/examples/CMakeLists.txt	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/CMakeLists.txt	2026-08-12 17:13:36.585057564 +0200
+@@ -1,11 +1,12 @@
+-add_library(common STATIC common.cpp)
+-target_include_directories(common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+-target_compile_features(common PUBLIC cxx_std_11)
++find_package(Threads REQUIRED)
++
++add_library(bark-common STATIC common.cpp)
++target_include_directories(bark-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_compile_features(bark-common PUBLIC cxx_std_11)
++set_target_properties(bark-common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+ if (EMSCRIPTEN)
+     add_subdirectory(wasm)
+-    set_target_properties(libmain PROPERTIES FOLDER "libs")
+-    set_target_properties(${TARGET} PROPERTIES COMPILE_FLAGS "-msimd128")
+ else()
+     add_subdirectory(main)
+     add_subdirectory(server)
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/common.cpp src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/common.cpp
+--- a/examples/common.cpp	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/common.cpp	2026-08-12 17:14:57.590160231 +0200
+@@ -35,6 +35,8 @@
+               << "                        prompt to start generation with (default: random)\n"
+               << "  -m FNAME, --model FNAME\n"
+               << "                        model path (default: " << params.model_path << ")\n"
++              << "  -ngl N, --n-gpu-layers N\n"
++              << "                        >0: best ggml backend (GPU if present); 0: CPU (default: " << params.n_gpu_layers << ")\n"
+               << "  -o FNAME, --outwav FNAME\n"
+               << "                        output generated wav (default: " << params.dest_wav_path << ")\n"
+               << "\n";
+@@ -48,8 +50,10 @@
+             params.n_threads = std::stoi(argv[++i]);
+         } else if (arg == "-p" || arg == "--prompt") {
+             params.prompt = argv[++i];
+-        } else if (arg == "-m" || arg == "--model_path") {
++        } else if (arg == "-m" || arg == "--model_path" || arg == "--model") {
+             params.model_path = argv[++i];
++        } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
++            params.n_gpu_layers = std::stoi(argv[++i]);
+         } else if (arg == "-s" || arg == "--seed") {
+             params.seed = std::stoi(argv[++i]);
+         } else if (arg == "-o" || arg == "--outwav") {
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/common.h src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/common.h
+--- a/examples/common.h	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/common.h	2026-08-12 17:14:40.017846431 +0200
+@@ -10,7 +10,10 @@
+     std::string prompt = "This is an audio generated by bark.cpp";
+ 
+     // Location of model weights.
+-    std::string model_path = "./ggml_weights";
++    std::string model_path = "./ggml_weights.bin";
++
++    // >0: best ggml backend (GPU plugin if present). 0: CPU.
++    int32_t n_gpu_layers = 99;
+ 
+     // Destination path for generated WAV file.
+     std::string dest_wav_path = "output.wav";
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/main/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/main/CMakeLists.txt
+--- a/examples/main/CMakeLists.txt	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/main/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,9 +1,4 @@
+-set(TARGET main)
+-add_executable(${TARGET} main.cpp)
+-target_link_libraries(${TARGET} PRIVATE bark common)
+-target_compile_features(${TARGET} PRIVATE cxx_std_11)
+-
+-if(MSVC)
+-    target_compile_definitions(${TARGET} PRIVATE -D_CRT_SECURE_NO_WARNINGS=1)
+-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:10485760")
+-endif()
+\ No newline at end of file
++add_executable(bark-cli main.cpp)
++target_link_libraries(bark-cli PRIVATE bark bark-common)
++target_compile_features(bark-cli PRIVATE cxx_std_11)
++install(TARGETS bark-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/main/main.cpp src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/main/main.cpp
+--- a/examples/main/main.cpp	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/main/main.cpp	2026-08-12 17:14:40.017846431 +0200
+@@ -51,6 +51,7 @@
+     ctx_params.verbosity = verbosity;
+     ctx_params.progress_callback = bark_print_progress_callback;
+     ctx_params.progress_callback_user_data = nullptr;
++    ctx_params.n_gpu_layers = params.n_gpu_layers;
+ 
+     struct bark_context *bctx = bark_load_model(params.model_path.c_str(), ctx_params, params.seed);
+     if (!bctx) {
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/quantize/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/quantize/CMakeLists.txt
+--- a/examples/quantize/CMakeLists.txt	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/quantize/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,4 +1,4 @@
+-set(TARGET quantize)
+-add_executable(${TARGET} main.cpp)
+-target_link_libraries(${TARGET} PRIVATE bark)
+-target_compile_features(${TARGET} PRIVATE cxx_std_11)
++add_executable(bark-quantize main.cpp)
++target_link_libraries(bark-quantize PRIVATE bark)
++target_compile_features(bark-quantize PRIVATE cxx_std_11)
++install(TARGETS bark-quantize RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/server/CMakeLists.txt src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/server/CMakeLists.txt
+--- a/examples/server/CMakeLists.txt	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/server/CMakeLists.txt	2026-08-12 17:13:36.577645822 +0200
+@@ -1,12 +1,6 @@
+-set(TARGET server)
+-add_executable(${TARGET} server.cpp httplib.h json.hpp)
+-
+-install(TARGETS ${TARGET} RUNTIME)
+-target_link_libraries(${TARGET} PRIVATE bark common ${CMAKE_THREAD_LIBS_INIT})
+-
++add_executable(bark-server server.cpp)
++target_link_libraries(bark-server PRIVATE bark bark-common Threads::Threads)
++install(TARGETS bark-server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+ if (WIN32)
+-    target_link_libraries(${TARGET} PRIVATE ws2_32)
+-    if(MSVC)
+-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:10485760")
+-    endif()
++    target_link_libraries(bark-server PRIVATE ws2_32)
+ endif()
+diff -ruN '--exclude=bark.swiftui' '--exclude=spm-headers' '--exclude=assets' '--exclude=wasm' '--exclude=Package.swift' '--exclude=*.png' '--exclude=.github' orig/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/server/server.cpp src/bark.cpp-5d5be84f089ab9ea53b7a793f088d3fbf7247495/examples/server/server.cpp
+--- a/examples/server/server.cpp	2024-11-16 15:20:46.000000000 +0100
++++ b/examples/server/server.cpp	2026-08-12 17:14:50.809810648 +0200
+@@ -2,6 +2,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
++#include <mutex>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -37,8 +38,9 @@
+     fprintf(stderr, "  -h, --help              show this help message and exit\n");
+     fprintf(stderr, "  -m MODEL, --model MODEL path to model\n");
+     fprintf(stderr, "  -t N, --threads N       number of threads to use during computation (default: %d)\n", params.n_threads);
+-    fprintf(stderr, "  -p PORT, --port PORT    port number\n");
+-    fprintf(stderr, "  -a IP, --adress IP      ip adress\n");
++    fprintf(stderr, "  -ngl N, --n-gpu-layers N  >0: best ggml backend; 0: CPU (default: %d)\n", params.n_gpu_layers);
++    fprintf(stderr, "  -p PORT, --port PORT    port number (default: %d)\n", server_params.port);
++    fprintf(stderr, "  -a IP, --address IP     bind address (default: %s)\n", server_params.hostname.c_str());
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -51,8 +53,8 @@
+         } else if (arg == "-m" || arg == "--model") {
+             params.model_path = argv[++i];
+             model_req = true;
+-        } else if (arg == "-t" || arg == "--thread") {
+-            params.n_threads = std::stoi(argv[++i]);
++        } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
++            params.n_gpu_layers = std::stoi(argv[++i]);
+         } else if (arg == "-p" || arg == "--port") {
+             server_params.port = std::stoi(argv[++i]);
+         } else if (arg == "-a" || arg == "--address") {
+@@ -105,6 +107,7 @@
+ 
+     struct bark_context_params ctx_params = bark_context_default_params();
+     ctx_params.verbosity = verbosity;
++    ctx_params.n_gpu_layers = params.n_gpu_layers;
+ 
+     struct bark_context *bctx = bark_load_model(params.model_path.c_str(), ctx_params, params.seed);
+     if (!bctx) {

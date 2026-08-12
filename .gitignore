@@ -1,0 +1,6 @@
+*.tar.gz
+RPMS/
+BUILD/
+BUILDROOT/
+SRPMS/
+*.buildlog
