@@ -18,7 +18,7 @@
 Summary:		Suno Bark text-to-speech in C/C++ (bark.cpp)
 Name:			bark-cpp
 Version:		1.0.0
-Release:		3
+Release:		4
 License:		MIT
 Group:			Sciences/Other
 URL:			https://github.com/PABannier/bark.cpp
@@ -30,10 +30,10 @@ Patch0:			0001-system-ggml.patch
 # Prefer -O3 over distro -Os for the inference hot path
 %global optflags %{optflags} -O3
 
-BuildRequires:	cmake(ggml) >= 0.21.0
+BuildRequires:	cmake(ggml) >= 0.22.0
 BuildRequires:	git-core
 
-Requires:	%{mklibname ggml}%{?_isa} >= 0.21.0
+Requires:	%{mklibname ggml}%{?_isa} >= 0.22.0
 Recommends:	ggml-backend-blas%{?_isa}
 Recommends:	ggml-backend-vulkan%{?_isa}
 Suggests:	ggml-backend-opencl%{?_isa}
