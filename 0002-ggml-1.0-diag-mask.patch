@@ -1,0 +1,62 @@
+From: OpenMandriva
+Subject: [PATCH] Rebuild the causal mask without DIAG_MASK_INF
+
+ggml 1.0 removed ggml_diag_mask_inf_inplace. The GPT graph masked
+keys with i > n_past + j. Build that mask from arange/step and add
+it. -1e9 stays finite so a zero gate does not become NaN.
+
+diff -u a/bark.cpp b/bark.cpp
+--- a/bark.cpp
++++ b/bark.cpp
+@@ -17,7 +17,7 @@
+ #include "bark.h"
+ #include "encodec.h"
+ 
+-#define BARK_MAX_NODES 4096
++#define BARK_MAX_NODES 8192
+ 
+ #define EPS_NORM 1e-5f
+ 
+@@ -1169,6 +1169,33 @@
+     return bctx;
+ }
+ 
++// ggml 1.0 removed ggml_diag_mask_inf_inplace (DIAG_MASK_INF).
++// scores is [n_kv, n_q, n_head]. Keep a key i for query j only when
++// i <= n_past + j, matching the old op: the loop started at column
++// n_past and wrote -inf where i > n_past + j.
++// The mask is [n_kv, n_q] and broadcasts across heads. -1e9, not -inf,
++// because a 0 gate times -inf is NaN; softmax still treats it as masked.
++static struct ggml_tensor * bark_causal_mask(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * scores,
++        int                   n_past) {
++    const int64_t n_kv = scores->ne[0];
++    const int64_t n_q  = scores->ne[1];
++    struct ggml_tensor * shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_q);
++    struct ggml_tensor * kpos = ggml_reshape_2d(
++            ctx, ggml_arange(ctx, 0.f, (float) n_kv, 1.f), n_kv, 1);
++    struct ggml_tensor * qpos = ggml_reshape_2d(
++            ctx,
++            ggml_arange(ctx, (float) n_past, (float) (n_past + n_q), 1.f),
++            1, n_q);
++    struct ggml_tensor * diff = ggml_sub(
++            ctx,
++            ggml_repeat(ctx, kpos, shape),
++            ggml_repeat(ctx, qpos, shape));
++    struct ggml_tensor * mask = ggml_scale(ctx, ggml_step(ctx, diff), -1.0e9f);
++    return ggml_add(ctx, scores, mask);
++}
++
+ static struct ggml_cgraph * bark_build_gpt_graph(
+           const gpt_model * model,
+           bark_sequence   & tokens,
+@@ -1303,7 +1330,7 @@
+ 
+             struct ggml_tensor* KQ_scaled = ggml_scale_inplace(ctx0, KQ, 1.0f/sqrtf(float(n_embd)/n_head));
+ 
+-            struct ggml_tensor* KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, *n_past);
++            struct ggml_tensor* KQ_masked = bark_causal_mask(ctx0, KQ_scaled, *n_past);
+ 
+             struct ggml_tensor* KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
+ 

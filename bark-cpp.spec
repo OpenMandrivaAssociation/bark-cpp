@@ -26,6 +26,8 @@ Source0:		https://github.com/PABannier/bark.cpp/archive/%{commit}/bark.cpp-%{com
 # Vendored as encodec.cpp/ (git submodule). ggml/ is dropped — system ggml.
 Source1:		https://github.com/PABannier/encodec.cpp/archive/%{encodec_commit}/encodec.cpp-%{encodec_commit}.tar.gz
 Patch0:			0001-system-ggml.patch
+# ggml 1.0 removed DIAG_MASK_INF. Rebuild that causal mask with arange.
+Patch1:			0002-ggml-1.0-diag-mask.patch
 
 # Prefer -O3 over distro -Os for the inference hot path
 %global optflags %{optflags} -O3
